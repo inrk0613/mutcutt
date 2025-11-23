@@ -1,59 +1,62 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Download, Activity, AlertTriangle, Info, RefreshCw } from 'lucide-react';
+import React, { useState, useRef } from 'react';
+import { Upload, Download, Activity, AlertTriangle, Info, RefreshCw, Zap } from 'lucide-react';
+
+// ==========================================
+// Color Science Logic & Constants
+// ==========================================
+
+// Matrix: Rec.709 Linear -> Blackmagic Wide Gamut (Approximation)
+const MAT_REC709_TO_BMD_WG = [
+  [0.722384, 0.165184, 0.112432],
+  [0.021028, 0.932909, 0.046063],
+  [0.007606, 0.028682, 0.963712]
+];
+
+// Utility: Clamp value between 0 and 1
+const clamp = (val) => Math.max(0, Math.min(1, val));
+
+// Utility: sRGB EOTF Inverse (sRGB -> Linear)
+const toLinear = (c) => {
+  return c <= 0.04045 
+    ? c / 12.92 
+    : Math.pow((c + 0.055) / 1.055, 2.4);
+};
+
+// Utility: Linear -> BMD Film Gen 5 Log Curve (Logarithmic Fit Approximation)
+const linToLogBMD = (x) => {
+  const a = 0.0869315;
+  const c = 0.618625;
+  const d = 0.490713;
+  const e = 0.006933; // Threshold for linear toe
+  const f = 0.0042;   // Black level offset
+
+  if (x < e) {
+    return (x * 4.0) + f; // Linear toe
+  }
+  return (c * Math.log10(x + a) + d); // Logarithmic curve
+};
+
+// Utility: Matrix Multiplication (1x3 * 3x3)
+const applyMatrix = (r, g, b, matrix) => {
+  const newR = r * matrix[0][0] + g * matrix[0][1] + b * matrix[0][2];
+  const newG = r * matrix[1][0] + g * matrix[1][1] + b * matrix[1][2];
+  const newB = r * matrix[2][0] + g * matrix[2][1] + b * matrix[2][2];
+  return [newR, newG, newB];
+};
+
+// ==========================================
+// Main Component
+// ==========================================
 
 const App = () => {
   const [imageSrc, setImageSrc] = useState(null);
   const [processedImageSrc, setProcessedImageSrc] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [resolution, setResolution] = useState({ width: 0, height: 0 });
-  const canvasRef = useRef(null);
+  
   const hiddenCanvasRef = useRef(null);
 
-  // Constants for Blackmagic Gen 5 Simulation
-  // NOTE: These matrices are approximations derived from color science papers
-  // for converting Rec.709 Linear to Blackmagic Wide Gamut Gen 5.
-  const MAT_REC709_TO_BMD_WG = [
-    [0.722384, 0.165184, 0.112432],
-    [0.021028, 0.932909, 0.046063],
-    [0.007606, 0.028682, 0.963712]
-  ];
-
-  // Utility: Clamp value between 0 and 1
-  const clamp = (val) => Math.max(0, Math.min(1, val));
-
-  // Utility: sRGB/Rec.709 to Linear
-  // Uses accurate sRGB linearization
-  const toLinear = (c) => {
-    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  };
-
-  // Utility: Linear to BMD Film Gen 5 Log Curve (Approximation)
-  // Based on the characteristic curve of Gen 5 Log
-  const linToLogBMD = (x) => {
-    // Official BMD Gen 5 curve parameters are proprietary/complex, 
-    // using a high-fidelity logarithmic fit for simulation.
-    // Cutoff and slope values tuned to match Resolve's behavior visually.
-    const a = 0.0869315;
-    const b = 0.0;
-    const c = 0.618625;
-    const d = 0.490713;
-    const e = 0.006933;
-    const f = 0.0042; // black level offset
-
-    if (x < e) {
-        return (x * 4.0) + f; // linear toe simulation
-    }
-    return (c * Math.log10(x + a) + d);
-  };
-
-  // Matrix Multiplication 3x3 * 3x1
-  const applyMatrix = (r, g, b, matrix) => {
-    const newR = r * matrix[0][0] + g * matrix[0][1] + b * matrix[0][2];
-    const newG = r * matrix[1][0] + g * matrix[1][1] + b * matrix[1][2];
-    const newB = r * matrix[2][0] + g * matrix[2][1] + b * matrix[2][2];
-    return [newR, newG, newB];
-  };
-
+  // Handle File Upload
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -71,17 +74,19 @@ const App = () => {
     reader.readAsDataURL(file);
   };
 
-  const processImage = async () => {
+  // Core Image Processing Function
+  const processImage = () => {
     if (!imageSrc) return;
     setIsProcessing(true);
 
-    // Use setTimeout to allow UI to update before heavy processing
+    // setTimeout allows the UI to render the "Processing" state before blocking the thread
     setTimeout(() => {
       const canvas = hiddenCanvasRef.current;
-      const ctx = canvas.getContext('2d', { colorSpace: 'srgb' }); // Ensure browser manages input as sRGB
+      const ctx = canvas.getContext('2d', { colorSpace: 'srgb' });
       const img = new Image();
       
       img.onload = () => {
+        // Setup Canvas
         canvas.width = img.width;
         canvas.height = img.height;
         ctx.drawImage(img, 0, 0);
@@ -89,32 +94,32 @@ const App = () => {
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const data = imageData.data;
 
-        // Process pixel by pixel
+        // Pixel Loop
         for (let i = 0; i < data.length; i += 4) {
-          // 1. Normalize 8-bit to 0-1 float
+          // 1. Normalize (8-bit -> Float)
           let r = data[i] / 255.0;
           let g = data[i + 1] / 255.0;
           let b = data[i + 2] / 255.0;
 
-          // 2. De-Gamma (sRGB to Linear)
+          // 2. Linearize (sRGB -> Linear)
           r = toLinear(r);
           g = toLinear(g);
           b = toLinear(b);
 
-          // 3. Apply Gamut Matrix (Rec.709 Linear -> BMD Wide Gamut Linear)
+          // 3. Color Space Transform (Rec.709 Linear -> BMD WG Linear)
           const [lr, lg, lb] = applyMatrix(r, g, b, MAT_REC709_TO_BMD_WG);
 
-          // 4. Apply OETF (Linear -> BMD Film Gen 5 Log)
-          // Ensure no negative values entering log
+          // 4. OETF (Linear -> BMD Film Gen 5 Log)
+          // Using max(0, val) to prevent NaNs in Log calculation
           const logR = linToLogBMD(Math.max(0, lr));
           const logG = linToLogBMD(Math.max(0, lg));
           const logB = linToLogBMD(Math.max(0, lb));
 
-          // 5. Quantize back to 8-bit for display/save
+          // 5. Quantize (Float -> 8-bit)
           data[i] = clamp(logR) * 255;
           data[i + 1] = clamp(logG) * 255;
           data[i + 2] = clamp(logB) * 255;
-          // Alpha remains unchanged
+          // Alpha (data[i+3]) remains unchanged
         }
 
         ctx.putImageData(imageData, 0, 0);
@@ -122,134 +127,150 @@ const App = () => {
         setIsProcessing(false);
       };
       img.src = imageSrc;
-    }, 100);
+    }, 50);
   };
 
   const downloadImage = () => {
     if (!processedImageSrc) return;
     const link = document.createElement('a');
     link.href = processedImageSrc;
-    link.download = 'converted_bmd_film.png';
+    link.download = `bmd_gen5_${Date.now()}.png`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
+  const resetState = () => {
+    setImageSrc(null);
+    setProcessedImageSrc(null);
+    setResolution({ width: 0, height: 0 });
+  };
+
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 font-sans selection:bg-teal-500 selection:text-white">
-      <div className="max-w-6xl mx-auto p-6">
+    <div className="min-h-screen bg-gray-950 text-gray-100 font-sans selection:bg-teal-500/30 selection:text-teal-200">
+      <div className="max-w-7xl mx-auto p-6 lg:p-10">
         
         {/* Header */}
-        <header className="mb-10 border-b border-gray-800 pb-6">
-          <h1 className="text-3xl font-bold tracking-tight text-white flex items-center gap-3">
-            <Activity className="text-teal-400" />
-            CST: ProRAW to Blackmagic
-          </h1>
-          <p className="mt-2 text-gray-400">
-            Color Space Transform Engine (Rec.709 Linear to BMD Wide Gamut / Film Gen 5)
+        <header className="mb-12 border-b border-gray-800 pb-8">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="bg-teal-900/30 p-2 rounded-lg">
+              <Activity className="text-teal-400 w-8 h-8" />
+            </div>
+            <h1 className="text-4xl font-bold tracking-tight text-white">
+              CST: ProRAW to Blackmagic
+            </h1>
+          </div>
+          <p className="text-gray-400 max-w-2xl leading-relaxed">
+            Color Space Transform Engine: Converts standard sRGB imagery into simulated 
+            <span className="text-teal-400 font-medium mx-1">Blackmagic Wide Gamut / Film Gen 5</span> 
+            log profile for grading workflows.
           </p>
-          <div className="mt-4 bg-gray-800/50 border border-amber-500/20 rounded-lg p-4 flex gap-3 text-sm text-amber-200/80">
+          
+          <div className="mt-6 bg-amber-900/20 border border-amber-500/20 rounded-lg p-4 flex gap-3 text-sm text-amber-200/80">
             <AlertTriangle className="w-5 h-5 shrink-0 text-amber-500" />
-            <div>
-              <p className="font-semibold text-amber-500 mb-1">精度に関する注意 (Accuracy Disclaimer)</p>
-              ブラウザ環境(8-bit Canvas)での数学的シミュレーションです。
-              真の12-bit RAWデータ保持やハイライト復元を行うものではありません。
-              入力画像は標準的なRec.709/sRGBとして解釈され、Blackmagic Design Filmの対数カーブ(Log)とガマットへ変換されます。
+            <div className="space-y-1">
+              <p className="font-bold text-amber-500">Accuracy Disclaimer</p>
+              <p>
+                This is a mathematical simulation in an 8-bit browser environment. 
+                It transforms sRGB input into BMD Log curves/gamut but cannot recover lost dynamic range 
+                from non-RAW sources.
+              </p>
             </div>
           </div>
         </header>
 
         {/* Main Workspace */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 xl:gap-12">
           
-          {/* Input Section */}
-          <div className="space-y-4">
-            <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-xl">
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                <Upload className="w-5 h-5" /> Source
-              </h2>
-              
-              {!imageSrc ? (
-                <div className="border-2 border-dashed border-gray-600 rounded-xl h-64 flex flex-col items-center justify-center hover:border-teal-500 transition-colors bg-gray-900/50 cursor-pointer relative">
-                  <input 
-                    type="file" 
-                    accept="image/*,.heic" 
-                    onChange={handleImageUpload} 
-                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                  />
-                  <div className="text-gray-500 text-center">
-                    <p className="text-teal-400 font-medium mb-1">Click to Upload</p>
-                    <p className="text-xs">JPG, PNG, or Converted TIFF</p>
-                  </div>
-                </div>
-              ) : (
-                <div className="relative group">
-                  <img src={imageSrc} alt="Original" className="w-full h-auto rounded-lg border border-gray-700" />
-                  <button 
-                    onClick={() => { setImageSrc(null); setProcessedImageSrc(null); }}
-                    className="absolute top-2 right-2 bg-black/70 hover:bg-red-600 text-white p-2 rounded-full transition-all opacity-0 group-hover:opacity-100"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                  </button>
-                  <div className="mt-2 flex justify-between text-xs text-gray-500 font-mono">
-                    <span>Input: sRGB/Rec.709</span>
-                    <span>{resolution.width} x {resolution.height}</span>
-                  </div>
-                </div>
-              )}
+          {/* LEFT: Input Section */}
+          <div className="flex flex-col gap-4">
+            <div className="bg-gray-900 rounded-2xl p-1 border border-gray-800 shadow-2xl shadow-black/50 overflow-hidden group">
+              {/* Image Container */}
+              <div className="relative bg-gray-950/50 min-h-[400px] flex items-center justify-center rounded-xl overflow-hidden">
+                {!imageSrc ? (
+                  <label className="cursor-pointer flex flex-col items-center justify-center w-full h-full min-h-[400px] border-2 border-dashed border-gray-800 hover:border-teal-500/50 hover:bg-gray-900/80 transition-all duration-300">
+                    <Upload className="w-10 h-10 text-gray-600 mb-4 group-hover:text-teal-400 transition-colors" />
+                    <span className="text-lg font-medium text-gray-400 group-hover:text-gray-200">Click to Upload Source</span>
+                    <span className="text-xs text-gray-600 mt-2 font-mono">JPG, PNG, HEIC supported</span>
+                    <input type="file" accept="image/*,.heic" onChange={handleImageUpload} className="hidden" />
+                  </label>
+                ) : (
+                  <>
+                    <img src={imageSrc} alt="Original" className="max-w-full max-h-[600px] object-contain" />
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-6">
+                      <div className="w-full flex justify-between items-center">
+                        <div className="font-mono text-xs text-gray-400 bg-black/50 px-3 py-1 rounded-full backdrop-blur-sm">
+                          {resolution.width} × {resolution.height} px
+                        </div>
+                        <button 
+                          onClick={resetState}
+                          className="bg-red-500/20 hover:bg-red-500/40 text-red-200 p-2 rounded-lg backdrop-blur-md transition-colors"
+                        >
+                          <RefreshCw className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
 
-            {imageSrc && (
-              <button
-                onClick={processImage}
-                disabled={isProcessing}
-                className={`w-full py-4 rounded-lg font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-2
-                  ${isProcessing 
-                    ? 'bg-gray-700 text-gray-400 cursor-not-allowed' 
-                    : 'bg-teal-600 hover:bg-teal-500 text-white hover:scale-[1.02]'
-                  }`}
-              >
-                {isProcessing ? (
-                  <>Processing Matrix...</>
-                ) : (
-                  <>Apply CST (Gen 5 Film)</>
-                )}
-              </button>
-            )}
+            {/* Action Button */}
+            <button
+              onClick={processImage}
+              disabled={!imageSrc || isProcessing}
+              className={`w-full py-4 rounded-xl font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-3 border
+                ${!imageSrc 
+                  ? 'bg-gray-800 border-gray-800 text-gray-600 cursor-not-allowed' 
+                  : isProcessing
+                    ? 'bg-gray-800 border-gray-700 text-teal-400 cursor-wait'
+                    : 'bg-teal-600 border-teal-500 hover:bg-teal-500 hover:border-teal-400 text-white hover:shadow-teal-900/20 hover:-translate-y-0.5'
+                }`}
+            >
+              {isProcessing ? (
+                <><RefreshCw className="animate-spin w-5 h-5" /> Processing Matrix...</>
+              ) : (
+                <><Zap className="w-5 h-5" /> Apply CST (Gen 5 Film)</>
+              )}
+            </button>
           </div>
 
-          {/* Output Section */}
-          <div className="space-y-4">
-             <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-xl h-full flex flex-col">
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2 text-teal-400">
-                <Activity className="w-5 h-5" /> Output Scope
-              </h2>
+          {/* RIGHT: Output Section */}
+          <div className="flex flex-col h-full">
+             <div className="bg-gray-900 rounded-2xl p-1 border border-gray-800 shadow-2xl shadow-black/50 flex-grow flex flex-col relative overflow-hidden">
               
-              <div className="flex-grow bg-gray-900/50 rounded-xl border border-gray-700 flex items-center justify-center overflow-hidden min-h-[300px]">
+              {/* Output Header */}
+              <div className="absolute top-4 left-4 z-10 font-mono text-xs flex flex-col gap-1">
+                 <span className="text-gray-500 uppercase tracking-wider">Output Transform</span>
+                 <span className="text-teal-400 bg-teal-950/50 px-2 py-0.5 rounded border border-teal-900/50">BMD Film Gen 5</span>
+              </div>
+
+              <div className="flex-grow bg-gray-950/50 rounded-xl flex items-center justify-center min-h-[400px] overflow-hidden relative">
+                {/* Background Grid Pattern */}
+                <div className="absolute inset-0 opacity-5" style={{ backgroundImage: 'radial-gradient(#4fd1c5 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
+
                 {processedImageSrc ? (
-                  <img src={processedImageSrc} alt="Processed" className="max-w-full max-h-full object-contain" />
+                  <img src={processedImageSrc} alt="Processed" className="max-w-full max-h-[600px] object-contain relative z-0 shadow-2xl" />
                 ) : (
-                  <div className="text-gray-600 flex flex-col items-center">
-                     <Info className="w-8 h-8 mb-2 opacity-20" />
-                     <p>Waiting for processing</p>
+                  <div className="text-gray-700 flex flex-col items-center z-0">
+                     <Activity className="w-12 h-12 mb-4 opacity-20" />
+                     <p className="font-mono text-sm">Waiting for processing...</p>
                   </div>
                 )}
               </div>
               
+              {/* Output Footer / Download */}
               {processedImageSrc && (
-                <div className="mt-4 pt-4 border-t border-gray-700">
-                   <div className="flex justify-between items-center mb-4">
-                      <div className="text-xs text-gray-400">
-                        <p>Target Gamut: <span className="text-teal-400">BMD Wide Gamut</span></p>
-                        <p>Target Gamma: <span className="text-teal-400">BMD Film Gen 5</span></p>
-                      </div>
-                      <button
-                        onClick={downloadImage}
-                        className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
-                      >
-                        <Download className="w-4 h-4" /> Download PNG
-                      </button>
+                <div className="p-4 bg-gray-900 border-t border-gray-800 flex justify-between items-center">
+                   <div className="text-xs text-gray-500 font-mono">
+                      Log Encoding Complete
                    </div>
+                   <button
+                     onClick={downloadImage}
+                     className="bg-gray-100 hover:bg-white text-gray-900 px-5 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all hover:shadow-lg hover:shadow-white/10"
+                   >
+                     <Download className="w-4 h-4" /> Download PNG
+                   </button>
                 </div>
               )}
             </div>
@@ -257,14 +278,30 @@ const App = () => {
         </div>
 
         {/* Technical Footer */}
-        <div className="mt-12 border-t border-gray-800 pt-8 text-xs text-gray-500 space-y-2 font-mono">
-          <p className="uppercase tracking-wider font-bold text-gray-400">Processing Pipeline Details</p>
-          <ul className="list-disc pl-4 space-y-1">
-            <li>Input Gamma Linearization (sRGB EOTF Inverse)</li>
-            <li>3x3 Matrix Transformation: Rec.709 RGB Primaries to Blackmagic Wide Gamut</li>
-            <li>Output Log Encoding: Mathematical approximation of Blackmagic Design Gen 5 Film curve</li>
-            <li>Processing Precision: 32-bit Float (Internal) / 8-bit Integer (Display)</li>
-          </ul>
+        <div className="mt-16 border-t border-gray-800/50 pt-8">
+          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-4">Pipeline Specification</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-gray-400 font-mono">
+            <ul className="space-y-2">
+              <li className="flex gap-2">
+                <span className="text-gray-600">01.</span> 
+                <span>Linearization: Inverse sRGB EOTF</span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-gray-600">02.</span> 
+                <span>Gamut Mapping: 3x3 Matrix (Rec.709 → BMD Wide Gamut)</span>
+              </li>
+            </ul>
+            <ul className="space-y-2">
+              <li className="flex gap-2">
+                <span className="text-gray-600">03.</span> 
+                <span>OETF Encoding: Logarithmic fit to BMD Gen 5 Curve</span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-gray-600">04.</span> 
+                <span>Output Depth: 8-bit (Browser Limitation)</span>
+              </li>
+            </ul>
+          </div>
         </div>
 
       </div>
@@ -276,4 +313,3 @@ const App = () => {
 };
 
 export default App;
-
